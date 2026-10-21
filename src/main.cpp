@@ -10,6 +10,15 @@
 // screen is not detected by UI::numPauseGame (v8 log: zero blocked lines,
 // moves ran while the load screen was stuck), and moving the player during
 // load restarts cell streaming and hangs the screen forever.
+// v10 (Stage 4): the network no longer moves the PLAYER. A one-time puppet
+// NPC (spawned via PlaceAtMe from the player's own base form) is what
+// circles - the actual co-op architecture. Reason: v9 proved the load
+// completes and the world is live, but the first player MoveRefrToPosition
+// in a live game triggers a loading screen (535-unit same-cell move!)
+// which our moves then keep re-triggering. NPCs take a well-trodden path
+// (companion tracking uses the same move); the player-specific load path is
+// a rabbit hole the mod does not need: local players are driven by local
+// input, only puppets move by network.
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -51,6 +60,10 @@ static const uintptr_t kMoveRefrOffset      = 0x013FE7E0; // MoveRefrToPosition
 static const uintptr_t kGetWorldspaceOffset = 0x0040F290; // TESObjectREFR::GetWorldspace
 static const uintptr_t kUiSingletonOffset   = 0x058D0898; // g_ui
 static const uintptr_t kUiPauseCountOffset  = 0x1E0;      // UI::numPauseGame
+static const uintptr_t kBaseFormOffset       = 0xE0;       // TESObjectREFR::baseForm
+static const uintptr_t kGameVMOffset         = 0x058D3308; // g_gameVM
+static const uintptr_t kVMOffset             = 0xB0;       // GameVM::m_virtualMachine
+static const uintptr_t kPlaceAtMeOffset      = 0x0140B0E0; // PlaceAtMe_Native
 
 // safety: never drag the player farther than this in one move (units)
 static const float kMaxDragDist = 5000.0f;
@@ -62,6 +75,11 @@ static const unsigned kArmGraceMs = 10000;
 typedef void (*_MoveRefrToPosition)(void* source, UInt32* pTargetHandle,
     void* parentCell, void* worldSpace, float* position, float* rotation);
 typedef void* (*_GetWorldspace)(void* refr);
+typedef void* (*_PlaceAtMe_Native)(void* vm, UInt32 stackId, void** target,
+    void* form, int count, bool forcePersist, bool initiallyDisabled,
+    bool deleteWhenAble);
+
+static std::atomic<void*> g_puppet{nullptr}; // driven NPC, not the player
 
 // ---- logging ------------------------------------------------------------
 static void logline(const char* fmt, ...)
@@ -197,12 +215,10 @@ public:
 
         void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
         if (!player) return;
-        void* parentCell = *(void**)((char*)player + kParentCellOffset);
-        if (!parentCell) return;
 
         // never move while a menu/loading screen is up (UI::numPauseGame,
-        // "isInMenuMode" per GameMenus.h). Moving the player during save
-        // load hangs the loading screen forever (observed in v6).
+        // "isInMenuMode" per GameMenus.h). Moving during a load screen
+        // restarts cell streaming and hangs the load forever (v6/v8).
         void* ui = *(void**)(g_gameBase + kUiSingletonOffset);
         if (!ui) return;
         UInt32 pauseCount = *(UInt32*)((char*)ui + kUiPauseCountOffset);
@@ -216,10 +232,49 @@ public:
         }
         s_menuBlockLogged = false;
 
-        float cur[3];
-        memcpy(cur, (char*)player + kPosOffset, sizeof(cur));
+        // one-time puppet spawn: PlaceAtMe the player's own base form, so
+        // the puppet is a copy of the player - no FormID guesswork.
+        void* puppet = g_puppet.load();
+        if (!puppet)
+        {
+            void* baseForm = *(void**)((char*)player + kBaseFormOffset);
+            void* gameVM = *(void**)(g_gameBase + kGameVMOffset);
+            void* vm = gameVM ? *(void**)((char*)gameVM + kVMOffset) : nullptr;
+            static std::atomic<int> s_spawnFails{0};
+            if (!baseForm || !vm)
+            {
+                if (++s_spawnFails <= 3)
+                    logline("[f4-coop] spawn blocked: base=%p vm=%p",
+                            baseForm, vm);
+                return;
+            }
+            _PlaceAtMe_Native placeAtMe =
+                (_PlaceAtMe_Native)(g_gameBase + kPlaceAtMeOffset);
+            logline("[f4-coop] spawning puppet: player=%p base=%p vm=%p",
+                    player, baseForm, vm);
+            puppet = placeAtMe(vm, 0, &player, baseForm, 1, false, false, false);
+            if (!puppet)
+            {
+                if (++s_spawnFails <= 3)
+                    logline("[f4-coop] PlaceAtMe returned null");
+                return;
+            }
+            s_spawnFails = 0;
+            g_puppet = puppet;
+            logline("[f4-coop] puppet spawned: %p", puppet);
+        }
 
-        // safety: never drag the player across the world (stale anchor,
+        void* parentCell = *(void**)((char*)puppet + kParentCellOffset);
+        if (!parentCell) return;
+
+        _GetWorldspace getWorldspace =
+            (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
+        void* worldspace = getWorldspace(puppet);
+
+        float cur[3];
+        memcpy(cur, (char*)puppet + kPosOffset, sizeof(cur));
+
+        // safety: never drag the puppet across the world (stale anchor,
         // corrupt packet)
         float ddx = g.x - cur[0], ddy = g.y - cur[1], ddz = g.z - cur[2];
         float dist2 = ddx * ddx + ddy * ddy + ddz * ddz;
@@ -232,10 +287,6 @@ public:
             return;
         }
         s_farLogged = false;
-
-        _GetWorldspace getWorldspace =
-            (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
-        void* worldspace = getWorldspace(player);
 
         // face the direction of movement (euler Z rotation, radians)
         float rot[3] = { 0.f, 0.f, atan2f(g.y - cur[1], g.x - cur[0]) };
@@ -252,12 +303,12 @@ public:
             logline("[f4-coop] moveRefr #%llu -> %.1f %.1f %.1f (cell=%p ws=%p)",
                     (unsigned long long)n, g.x, g.y, g.z, parentCell, worldspace);
 
-        moveRefr(player, &nullHandle, parentCell, worldspace, pos, rot);
+        moveRefr(puppet, &nullHandle, parentCell, worldspace, pos, rot);
 
         if (logIt)
         {
             float after[3];
-            memcpy(after, (char*)player + kPosOffset, sizeof(after));
+            memcpy(after, (char*)puppet + kPosOffset, sizeof(after));
             logline("[f4-coop] move #%llu done, pos now %.1f %.1f %.1f",
                     (unsigned long long)n, after[0], after[1], after[2]);
         }
@@ -278,8 +329,9 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
     }
     if (msg->type == F4SEMessagingInterface::kMessage_PreLoadGame)
     {
-        logline("[f4-coop] PreLoadGame - apply disabled");
+        logline("[f4-coop] PreLoadGame - apply disabled, puppet cleared");
         g_applyArmed = false;
+        g_puppet = nullptr; // stale after the world changes
     }
     if (msg->type == F4SEMessagingInterface::kMessage_PostLoadGame)
     {
@@ -296,8 +348,9 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
     }
     if (msg->type == F4SEMessagingInterface::kMessage_NewGame)
     {
-        logline("[f4-coop] NewGame - apply disabled");
+        logline("[f4-coop] NewGame - apply disabled, puppet cleared");
         g_applyArmed = false;
+        g_puppet = nullptr;
     }
 }
 
@@ -361,7 +414,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 9;
+        info->version     = 10;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -396,7 +449,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v9, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v10, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
