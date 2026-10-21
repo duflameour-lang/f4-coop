@@ -1,6 +1,9 @@
 // f4-coop - Stage 3, step B: network-controlled self position via the
 // engine's own move (MoveRefrToPosition, the native behind Papyrus MoveTo),
 // applied on the game thread through F4SE's task interface.
+// v7: moves are gated on the save-load lifecycle (PostLoadGame arms,
+// PreLoadGame disarms) and on UI pause mode (loading screens, Pip-Boy):
+// applying moves during save load hangs the load screen forever.
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -28,6 +31,7 @@ static PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 static F4SEMessagingInterface* g_messaging = nullptr;
 static F4SETaskInterface* g_tasks = nullptr;
 static std::atomic<bool> g_worldLoaded{false};
+static std::atomic<bool> g_applyArmed{false}; // armed by PostLoadGame
 static uintptr_t g_gameBase = 0;
 
 // Offsets verified against ianpatt/f4se tag v0.6.23 (RelocAddr/RelocPtr
@@ -38,6 +42,11 @@ static const uintptr_t kPosOffset           = 0xD0;       // TESObjectREFR::pos
 static const uintptr_t kInvalidHandleOffset = 0x038CCE04; // g_invalidRefHandle
 static const uintptr_t kMoveRefrOffset      = 0x013FE7E0; // MoveRefrToPosition
 static const uintptr_t kGetWorldspaceOffset = 0x0040F290; // TESObjectREFR::GetWorldspace
+static const uintptr_t kUiSingletonOffset   = 0x058D0898; // g_ui
+static const uintptr_t kUiPauseCountOffset  = 0x1E0;      // UI::numPauseGame
+
+// safety: never drag the player farther than this in one move (units)
+static const float kMaxDragDist = 5000.0f;
 
 typedef void (*_MoveRefrToPosition)(void* source, UInt32* pTargetHandle,
     void* parentCell, void* worldSpace, float* position, float* rotation);
@@ -49,6 +58,10 @@ static void logline(const char* fmt, ...)
     FILE* f = nullptr;
     fopen_s(&f, "f4coop.log", "a");
     if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%02u:%02u:%02u.%03u ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     va_list ap; va_start(ap, fmt);
     vfprintf(f, fmt, ap);
     fprintf(f, "\n");
@@ -157,27 +170,58 @@ public:
     {
         g_taskInFlight = false; // a fresh task may be posted from here on
 
+        if (!g_applyArmed) return; // no save load completed yet
+
         GhostState g;
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
             g = g_ghost;
         }
         if (g.version == 0) return;
-        if (fabsf(g.x) > 1e6f || fabsf(g.y) > 1e6f || fabsf(g.z) > 1e6f)
-            return; // sanity: never teleport to garbage
 
         void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
         if (!player) return;
         void* parentCell = *(void**)((char*)player + kParentCellOffset);
         if (!parentCell) return;
 
+        // never move while a menu/loading screen is up (UI::numPauseGame,
+        // "isInMenuMode" per GameMenus.h). Moving the player during save
+        // load hangs the loading screen forever (observed in v6).
+        void* ui = *(void**)(g_gameBase + kUiSingletonOffset);
+        if (!ui) return;
+        UInt32 pauseCount = *(UInt32*)((char*)ui + kUiPauseCountOffset);
+        static std::atomic<bool> s_menuBlockLogged{false};
+        if (pauseCount != 0)
+        {
+            if (!s_menuBlockLogged.exchange(true))
+                logline("[f4-coop] blocked: menu/pause mode (pauseCount=%u)",
+                        pauseCount);
+            return;
+        }
+        s_menuBlockLogged = false;
+
+        float cur[3];
+        memcpy(cur, (char*)player + kPosOffset, sizeof(cur));
+
+        // safety: never drag the player across the world (stale anchor,
+        // corrupt packet)
+        float ddx = g.x - cur[0], ddy = g.y - cur[1], ddz = g.z - cur[2];
+        float dist2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        static std::atomic<bool> s_farLogged{false};
+        if (dist2 > kMaxDragDist * kMaxDragDist)
+        {
+            if (!s_farLogged.exchange(true))
+                logline("[f4-coop] blocked: ghost too far (%.0f units)",
+                        sqrtf(dist2));
+            return;
+        }
+        s_farLogged = false;
+
         _GetWorldspace getWorldspace =
             (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
         void* worldspace = getWorldspace(player);
 
         // face the direction of movement (euler Z rotation, radians)
-        float cur[3];
-        memcpy(cur, (char*)player + kPosOffset, sizeof(cur));
         float rot[3] = { 0.f, 0.f, atan2f(g.y - cur[1], g.x - cur[0]) };
         float pos[3] = { g.x, g.y, g.z };
 
@@ -214,6 +258,23 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
         logline("[f4-coop] GameLoaded");
         g_worldLoaded = true;
     }
+    if (msg->type == F4SEMessagingInterface::kMessage_PreLoadGame)
+    {
+        logline("[f4-coop] PreLoadGame - apply disabled");
+        g_applyArmed = false;
+    }
+    if (msg->type == F4SEMessagingInterface::kMessage_PostLoadGame)
+    {
+        bool ok = msg->data ? *(bool*)msg->data : false;
+        logline("[f4-coop] PostLoadGame ok=%d - apply %s", ok,
+                ok ? "armed" : "disabled");
+        g_applyArmed = ok;
+    }
+    if (msg->type == F4SEMessagingInterface::kMessage_NewGame)
+    {
+        logline("[f4-coop] NewGame - apply disabled");
+        g_applyArmed = false;
+    }
 }
 
 static void positionThreadMain()
@@ -240,7 +301,7 @@ static void positionThreadMain()
             std::lock_guard<std::mutex> lk(g_ghostLock);
             version = g_ghost.version;
         }
-        if (version != lastPosted && g_tasks &&
+        if (g_applyArmed && version != lastPosted && g_tasks &&
             !g_taskInFlight.exchange(true))
         {
             lastPosted = version;
@@ -265,7 +326,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 6;
+        info->version     = 7;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -300,7 +361,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v6, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v7, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
