@@ -1,4 +1,4 @@
-// f4-coop - Stage 2, step 1: send player position over UDP (transport test).
+// f4-coop - Stage 3, step A: network-controlled self position (puppet test).
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned int UInt32;
 typedef unsigned long long UInt64;
@@ -14,6 +14,7 @@ typedef unsigned long long UInt64;
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 #include <thread>
 
 static PluginHandle g_pluginHandle = kPluginHandle_Invalid;
@@ -24,6 +25,19 @@ static uintptr_t g_gameBase = 0;
 // Offsets verified against ianpatt/f4se tag v0.6.23.
 static const uintptr_t kPlayerPtrOffset = 0x05AA4388;
 static const uintptr_t kPosOffset = 0xD0;
+
+// ---- logging ------------------------------------------------------------
+static void logline(const char* fmt, ...)
+{
+    FILE* f = nullptr;
+    fopen_s(&f, "f4coop.log", "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    fprintf(f, "\n");
+    va_end(ap);
+    fclose(f);
+}
 
 // ---- UDP transport ------------------------------------------------------
 static SOCKET g_sock = INVALID_SOCKET;
@@ -45,6 +59,18 @@ static bool udpInit()
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) return false;
+
+    // bind to an arbitrary source port so replies can come back to us
+    sockaddr_in self = {};
+    self.sin_family = AF_INET;
+    self.sin_port = 0;
+    self.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(g_sock, (sockaddr*)&self, sizeof(self)) != 0) return false;
+
+    // non-blocking receive
+    u_long nb = 1;
+    ioctlsocket(g_sock, FIONBIO, &nb);
+
     g_dest.sin_family = AF_INET;
     g_dest.sin_port = htons(kPort);
     inet_pton(AF_INET, "127.0.0.1", &g_dest.sin_addr);
@@ -61,19 +87,37 @@ static void udpSendPos(float x, float y, float z)
     sendto(g_sock, (const char*)&p, sizeof(p), 0,
            (sockaddr*)&g_dest, sizeof(g_dest));
 }
-// -------------------------------------------------------------------------
 
-static void logline(const char* fmt, ...)
+static void udpTryRecv()
 {
-    FILE* f = nullptr;
-    fopen_s(&f, "f4coop.log", "a");
-    if (!f) return;
-    va_list ap; va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    fprintf(f, "\n");
-    va_end(ap);
-    fclose(f);
+    if (g_sock == INVALID_SOCKET) return;
+    static float s_lastRxX = 1e30f;
+    for (int i = 0; i < 10; i++)
+    {
+        PosPacket p = {};
+        sockaddr_in from = {};
+        int fromLen = sizeof(from);
+        int n = recvfrom(g_sock, (char*)&p, sizeof(p), 0,
+                         (sockaddr*)&from, &fromLen);
+        if (n != sizeof(p)) break; // nothing more (WSAEWOULDBLOCK)
+        if (p.magic != kMagic) continue;
+
+        if (p.x != s_lastRxX)
+        {
+            logline("[f4-coop] rx seq=%u pos %.1f %.1f %.1f",
+                    p.seq, p.x, p.y, p.z);
+            s_lastRxX = p.x;
+        }
+
+        // Stage 3A test: received position controls SELF.
+        // Copies x,y,z (12 bytes) into the local player's pos field.
+        // The ghost bot orbits, so the player is dragged in a circle.
+        void* me = *(void**)(g_gameBase + kPlayerPtrOffset);
+        if (me)
+            memcpy((char*)me + kPosOffset, &p.x, 12);
+    }
 }
+// -------------------------------------------------------------------------
 
 static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
 {
@@ -101,6 +145,7 @@ static void positionThreadMain()
         float z = *(float*)((char*)player + kPosOffset + 8);
 
         udpSendPos(x, y, z);
+        udpTryRecv();
 
         float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
         bool moved = !haveLast || (fabsf(dx) + fabsf(dy) + fabsf(dz)) > 0.5f;
@@ -120,11 +165,12 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 3;
+        info->version     = 5;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
-            logline("[f4-coop] refuse: runtime 0x%08X, want 1.10.163", f4se->runtimeVersion);
+            logline("[f4-coop] refuse: runtime 0x%08X, want 1.10.163",
+                    f4se->runtimeVersion);
             return false;
         }
         return true;
@@ -146,11 +192,11 @@ extern "C"
         if (!udpInit())
             logline("[f4-coop] udp init FAILED (wsa=%d)", WSAGetLastError());
         else
-            logline("[f4-coop] udp -> 127.0.0.1:%u", kPort);
+            logline("[f4-coop] udp bound, sending to 127.0.0.1:%u", kPort);
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v3, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v5, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
