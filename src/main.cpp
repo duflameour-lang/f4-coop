@@ -6,6 +6,10 @@
 // applying moves during save load hangs the load screen forever.
 // v8: PostLoadGame bool is value-encoded in msg->data - never dereference
 // it (v7 crashed the game on every save load).
+// v9: after PostLoadGame, applying waits out a grace period: the loading
+// screen is not detected by UI::numPauseGame (v8 log: zero blocked lines,
+// moves ran while the load screen was stuck), and moving the player during
+// load restarts cell streaming and hangs the screen forever.
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -34,6 +38,7 @@ static F4SEMessagingInterface* g_messaging = nullptr;
 static F4SETaskInterface* g_tasks = nullptr;
 static std::atomic<bool> g_worldLoaded{false};
 static std::atomic<bool> g_applyArmed{false}; // armed by PostLoadGame
+static std::atomic<unsigned long long> g_armedAtTick{0}; // GetTickCount64
 static uintptr_t g_gameBase = 0;
 
 // Offsets verified against ianpatt/f4se tag v0.6.23 (RelocAddr/RelocPtr
@@ -49,6 +54,10 @@ static const uintptr_t kUiPauseCountOffset  = 0x1E0;      // UI::numPauseGame
 
 // safety: never drag the player farther than this in one move (units)
 static const float kMaxDragDist = 5000.0f;
+
+// after PostLoadGame, wait this long before applying any move: the load
+// must finish undisturbed or the loading screen never dismisses
+static const unsigned kArmGraceMs = 10000;
 
 typedef void (*_MoveRefrToPosition)(void* source, UInt32* pTargetHandle,
     void* parentCell, void* worldSpace, float* position, float* rotation);
@@ -174,6 +183,11 @@ public:
 
         if (!g_applyArmed) return; // no save load completed yet
 
+        // grace: the load must finish undisturbed before the first move
+        // (moving during the load screen hangs it forever)
+        if (GetTickCount64() - g_armedAtTick.load() < kArmGraceMs)
+            return;
+
         GhostState g;
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
@@ -274,9 +288,11 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
         // NOT a pointer to a bool. Never dereference msg->data here
         // (v7 did and crashed the game on every save load).
         bool ok = (msg->data != nullptr);
-        logline("[f4-coop] PostLoadGame ok=%d - apply %s", ok,
-                ok ? "armed" : "disabled");
+        logline("[f4-coop] PostLoadGame ok=%d - apply %s (%u ms grace)",
+                ok, ok ? "armed" : "disabled", kArmGraceMs);
         g_applyArmed = ok;
+        if (ok)
+            g_armedAtTick = GetTickCount64();
     }
     if (msg->type == F4SEMessagingInterface::kMessage_NewGame)
     {
@@ -309,7 +325,18 @@ static void positionThreadMain()
             std::lock_guard<std::mutex> lk(g_ghostLock);
             version = g_ghost.version;
         }
-        if (g_applyArmed && version != lastPosted && g_tasks &&
+        bool armedNow =
+            g_applyArmed &&
+            (GetTickCount64() - g_armedAtTick.load() >= kArmGraceMs);
+        static bool s_graceLogged = false;
+        if (armedNow && !s_graceLogged)
+        {
+            s_graceLogged = true;
+            logline("[f4-coop] grace elapsed, applying moves");
+        }
+        if (!g_applyArmed)
+            s_graceLogged = false; // re-log after the next load
+        if (armedNow && version != lastPosted && g_tasks &&
             !g_taskInFlight.exchange(true))
         {
             lastPosted = version;
@@ -334,7 +361,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 8;
+        info->version     = 9;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -369,7 +396,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v8, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v9, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
