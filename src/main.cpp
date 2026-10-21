@@ -19,6 +19,10 @@
 // (companion tracking uses the same move); the player-specific load path is
 // a rabbit hole the mod does not need: local players are driven by local
 // input, only puppets move by network.
+// v11 (Stage 5): protocol v2 - packets carry a playerId; one puppet per
+// remote player (id 0 is "self" and is never puppeted). The bot now
+// simulates two virtual players, so two clones must circle at once - the
+// N-players primitive for "everyone sees everyone".
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -39,8 +43,11 @@ typedef unsigned long long UInt64;
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 
 static PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 static F4SEMessagingInterface* g_messaging = nullptr;
@@ -79,7 +86,8 @@ typedef void* (*_PlaceAtMe_Native)(void* vm, UInt32 stackId, void** target,
     void* form, int count, bool forcePersist, bool initiallyDisabled,
     bool deleteWhenAble);
 
-static std::atomic<void*> g_puppet{nullptr}; // driven NPC, not the player
+// one driven NPC per remote playerId; game-thread only (Run + load events)
+static std::map<unsigned int, void*> g_puppets;
 
 // ---- logging ------------------------------------------------------------
 static void logline(const char* fmt, ...)
@@ -107,6 +115,7 @@ struct PosPacket
 {
     unsigned int magic;
     unsigned int seq;
+    unsigned int playerId; // 0 = the sending client's own player
     float x, y, z;
 };
 static const unsigned int kMagic = 0x46344350u; // "F4CP"
@@ -142,19 +151,20 @@ static void udpSendPos(float x, float y, float z)
     PosPacket p;
     p.magic = kMagic;
     p.seq = g_seq++;
+    p.playerId = 0; // self
     p.x = x; p.y = y; p.z = z;
     sendto(g_sock, (const char*)&p, sizeof(p), 0,
            (sockaddr*)&g_dest, sizeof(g_dest));
 }
 
 // ---- ghost state: net thread writes, game thread applies ----------------
-struct GhostState
+struct GhostEntry
 {
-    UInt64 version; // bumped on every store, 0 = nothing yet
     float x, y, z;
 };
 static std::mutex g_ghostLock;
-static GhostState g_ghost = {};
+static std::map<unsigned int, GhostEntry> g_ghosts; // playerId -> pos
+static UInt64 g_ghostVersion = 0;                   // bumped on every store
 static std::atomic<bool> g_taskInFlight{false};
 
 static void udpTryRecv()
@@ -178,12 +188,13 @@ static void udpTryRecv()
             s_lastRxX = p.x;
         }
 
-        // Stage 3B: the net thread only records the latest ghost position;
-        // the actual move happens on the game thread (ApplyGhostMoveTask).
+        // the net thread only records the latest position per player;
+        // the actual moves happen on the game thread (ApplyGhostMoveTask)
+        if (p.playerId == 0) continue; // our own echo - never puppet self
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
-            g_ghost.version++;
-            g_ghost.x = p.x; g_ghost.y = p.y; g_ghost.z = p.z;
+            g_ghostVersion++;
+            g_ghosts[p.playerId] = { p.x, p.y, p.z };
         }
     }
 }
@@ -206,12 +217,13 @@ public:
         if (GetTickCount64() - g_armedAtTick.load() < kArmGraceMs)
             return;
 
-        GhostState g;
+        std::vector<std::pair<unsigned int, GhostEntry>> ghosts;
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
-            g = g_ghost;
+            for (auto& kv : g_ghosts)
+                ghosts.push_back(kv);
         }
-        if (g.version == 0) return;
+        if (ghosts.empty()) return;
 
         void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
         if (!player) return;
@@ -232,85 +244,95 @@ public:
         }
         s_menuBlockLogged = false;
 
-        // one-time puppet spawn: PlaceAtMe the player's own base form, so
-        // the puppet is a copy of the player - no FormID guesswork.
-        void* puppet = g_puppet.load();
-        if (!puppet)
+        for (auto& gh : ghosts)
         {
-            void* baseForm = *(void**)((char*)player + kBaseFormOffset);
-            void* gameVM = *(void**)(g_gameBase + kGameVMOffset);
-            void* vm = gameVM ? *(void**)((char*)gameVM + kVMOffset) : nullptr;
-            static std::atomic<int> s_spawnFails{0};
-            if (!baseForm || !vm)
-            {
-                if (++s_spawnFails <= 3)
-                    logline("[f4-coop] spawn blocked: base=%p vm=%p",
-                            baseForm, vm);
-                return;
-            }
-            _PlaceAtMe_Native placeAtMe =
-                (_PlaceAtMe_Native)(g_gameBase + kPlaceAtMeOffset);
-            logline("[f4-coop] spawning puppet: player=%p base=%p vm=%p",
-                    player, baseForm, vm);
-            puppet = placeAtMe(vm, 0, &player, baseForm, 1, false, false, false);
+            void* puppet = nullptr;
+            auto it = g_puppets.find(gh.first);
+            if (it != g_puppets.end())
+                puppet = it->second;
+
+            // one-time puppet spawn per player: PlaceAtMe the player's own
+            // base form, so every puppet is a copy of the player - no
+            // FormID guesswork.
             if (!puppet)
             {
-                if (++s_spawnFails <= 3)
-                    logline("[f4-coop] PlaceAtMe returned null");
-                return;
+                void* baseForm = *(void**)((char*)player + kBaseFormOffset);
+                void* gameVM = *(void**)(g_gameBase + kGameVMOffset);
+                void* vm = gameVM ? *(void**)((char*)gameVM + kVMOffset) : nullptr;
+                static std::atomic<int> s_spawnFails{0};
+                if (!baseForm || !vm)
+                {
+                    if (++s_spawnFails <= 3)
+                        logline("[f4-coop] spawn blocked: base=%p vm=%p",
+                                baseForm, vm);
+                    return;
+                }
+                _PlaceAtMe_Native placeAtMe =
+                    (_PlaceAtMe_Native)(g_gameBase + kPlaceAtMeOffset);
+                logline("[f4-coop] spawning puppet %u: player=%p base=%p vm=%p",
+                        gh.first, player, baseForm, vm);
+                puppet = placeAtMe(vm, 0, &player, baseForm, 1, false, false, false);
+                if (!puppet)
+                {
+                    if (++s_spawnFails <= 3)
+                        logline("[f4-coop] PlaceAtMe(%u) returned null", gh.first);
+                    return;
+                }
+                s_spawnFails = 0;
+                g_puppets[gh.first] = puppet;
+                logline("[f4-coop] puppet %u spawned: %p", gh.first, puppet);
             }
-            s_spawnFails = 0;
-            g_puppet = puppet;
-            logline("[f4-coop] puppet spawned: %p", puppet);
-        }
 
-        void* parentCell = *(void**)((char*)puppet + kParentCellOffset);
-        if (!parentCell) return;
+            void* parentCell = *(void**)((char*)puppet + kParentCellOffset);
+            if (!parentCell) continue;
 
-        _GetWorldspace getWorldspace =
-            (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
-        void* worldspace = getWorldspace(puppet);
+            _GetWorldspace getWorldspace =
+                (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
+            void* worldspace = getWorldspace(puppet);
 
-        float cur[3];
-        memcpy(cur, (char*)puppet + kPosOffset, sizeof(cur));
+            float cur[3];
+            memcpy(cur, (char*)puppet + kPosOffset, sizeof(cur));
 
-        // safety: never drag the puppet across the world (stale anchor,
-        // corrupt packet)
-        float ddx = g.x - cur[0], ddy = g.y - cur[1], ddz = g.z - cur[2];
-        float dist2 = ddx * ddx + ddy * ddy + ddz * ddz;
-        static std::atomic<bool> s_farLogged{false};
-        if (dist2 > kMaxDragDist * kMaxDragDist)
-        {
-            if (!s_farLogged.exchange(true))
-                logline("[f4-coop] blocked: ghost too far (%.0f units)",
-                        sqrtf(dist2));
-            return;
-        }
-        s_farLogged = false;
+            // safety: never drag a puppet across the world (stale anchor,
+            // corrupt packet)
+            float ddx = gh.second.x - cur[0], ddy = gh.second.y - cur[1],
+                  ddz = gh.second.z - cur[2];
+            float dist2 = ddx * ddx + ddy * ddy + ddz * ddz;
+            static std::atomic<bool> s_farLogged{false};
+            if (dist2 > kMaxDragDist * kMaxDragDist)
+            {
+                if (!s_farLogged.exchange(true))
+                    logline("[f4-coop] blocked: ghost %u too far (%.0f units)",
+                            gh.first, sqrtf(dist2));
+                continue;
+            }
+            s_farLogged = false;
 
-        // face the direction of movement (euler Z rotation, radians)
-        float rot[3] = { 0.f, 0.f, atan2f(g.y - cur[1], g.x - cur[0]) };
-        float pos[3] = { g.x, g.y, g.z };
+            // face the direction of movement (euler Z rotation, radians)
+            float rot[3] = { 0.f, 0.f, atan2f(ddy, ddx) };
+            float pos[3] = { gh.second.x, gh.second.y, gh.second.z };
 
-        UInt32 nullHandle = *(UInt32*)(g_gameBase + kInvalidHandleOffset);
-        _MoveRefrToPosition moveRefr =
-            (_MoveRefrToPosition)(g_gameBase + kMoveRefrOffset);
+            UInt32 nullHandle = *(UInt32*)(g_gameBase + kInvalidHandleOffset);
+            _MoveRefrToPosition moveRefr =
+                (_MoveRefrToPosition)(g_gameBase + kMoveRefrOffset);
 
-        static std::atomic<UInt64> s_moves{0};
-        UInt64 n = ++s_moves;
-        bool logIt = (n <= 5 || n % 50 == 0);
-        if (logIt)
-            logline("[f4-coop] moveRefr #%llu -> %.1f %.1f %.1f (cell=%p ws=%p)",
-                    (unsigned long long)n, g.x, g.y, g.z, parentCell, worldspace);
+            static std::atomic<UInt64> s_moves{0};
+            UInt64 n = ++s_moves;
+            bool logIt = (n <= 5 || n % 50 == 0);
+            if (logIt)
+                logline("[f4-coop] moveRefr #%llu id=%u -> %.1f %.1f %.1f (cell=%p ws=%p)",
+                        (unsigned long long)n, gh.first, gh.second.x, gh.second.y,
+                        gh.second.z, parentCell, worldspace);
 
-        moveRefr(puppet, &nullHandle, parentCell, worldspace, pos, rot);
+            moveRefr(puppet, &nullHandle, parentCell, worldspace, pos, rot);
 
-        if (logIt)
-        {
-            float after[3];
-            memcpy(after, (char*)puppet + kPosOffset, sizeof(after));
-            logline("[f4-coop] move #%llu done, pos now %.1f %.1f %.1f",
-                    (unsigned long long)n, after[0], after[1], after[2]);
+            if (logIt)
+            {
+                float after[3];
+                memcpy(after, (char*)puppet + kPosOffset, sizeof(after));
+                logline("[f4-coop] move #%llu id=%u done, pos now %.1f %.1f %.1f",
+                        (unsigned long long)n, gh.first, after[0], after[1], after[2]);
+            }
         }
     }
 };
@@ -329,9 +351,9 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
     }
     if (msg->type == F4SEMessagingInterface::kMessage_PreLoadGame)
     {
-        logline("[f4-coop] PreLoadGame - apply disabled, puppet cleared");
+        logline("[f4-coop] PreLoadGame - apply disabled, puppets cleared");
         g_applyArmed = false;
-        g_puppet = nullptr; // stale after the world changes
+        g_puppets.clear(); // stale after the world changes
     }
     if (msg->type == F4SEMessagingInterface::kMessage_PostLoadGame)
     {
@@ -348,9 +370,9 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
     }
     if (msg->type == F4SEMessagingInterface::kMessage_NewGame)
     {
-        logline("[f4-coop] NewGame - apply disabled, puppet cleared");
+        logline("[f4-coop] NewGame - apply disabled, puppets cleared");
         g_applyArmed = false;
-        g_puppet = nullptr;
+        g_puppets.clear();
     }
 }
 
@@ -376,7 +398,7 @@ static void positionThreadMain()
         UInt64 version;
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
-            version = g_ghost.version;
+            version = g_ghostVersion;
         }
         bool armedNow =
             g_applyArmed &&
@@ -414,7 +436,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 10;
+        info->version     = 11;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -449,7 +471,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v10, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v11, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }

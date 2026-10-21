@@ -1,6 +1,6 @@
-// recv.cpp - Stage 3A test bot: acts as a "ghost player".
-// Anchors at (first position + 500 X), then replies with a position
-// moving in a circle (radius 300) around the anchor.
+// recv.cpp - Stage 5 test bot: simulates TWO network players ("ghosts").
+// Anchors each player at (first real position + offset), then replies with
+// positions moving in circles (different anchor/radius/direction per player).
 #include <cstdio>
 #include <cmath>
 #include <winsock2.h>
@@ -10,9 +10,20 @@ struct PosPacket
 {
     unsigned int magic;
     unsigned int seq;
+    unsigned int playerId;
     float x, y, z;
 };
 static const unsigned int kMagic = 0x46344350u; // "F4CP"
+
+struct VPlayer
+{
+    unsigned int id;
+    float ax, ay, az; // anchor
+    float radius;
+    float speed;      // radians per packet (sign = direction)
+    double angle;
+    unsigned int seq;
+};
 
 int main()
 {
@@ -32,11 +43,16 @@ int main()
         printf("bind failed: %d\n", WSAGetLastError());
         return 1;
     }
-    printf("ghost player bot on UDP 31337\n");
+    printf("ghost players bot on UDP 31337 (players 101, 102)\n");
 
-    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    VPlayer players[2] = {};
+    players[0].id = 101;
+    players[0].radius = 300.0f;
+    players[0].speed = 0.15f;  // ccw
+    players[1].id = 102;
+    players[1].radius = 250.0f;
+    players[1].speed = -0.10f; // cw
     bool haveAnchor = false;
-    double angle = 0.0;
 
     for (;;)
     {
@@ -53,20 +69,33 @@ int main()
             // world load (player object exists before being placed)
             if (p.x == 2048.0f && p.y == 2048.0f && p.z == 0.0f)
                 continue;
-            ax = p.x + 500.0f;
-            ay = p.y;
-            az = p.z;
+            players[0].ax = p.x + 500.0f;
+            players[0].ay = p.y;
+            players[1].ax = p.x;
+            players[1].ay = p.y + 500.0f;
+            players[0].az = players[1].az = p.z;
+            players[0].angle = 0.0;
+            players[1].angle = 1.5;
             haveAnchor = true;
-            printf("anchor set: %.1f %.1f %.1f\n", ax, ay, az);
+            printf("anchor set: p101 (%.1f %.1f), p102 (%.1f %.1f)\n",
+                   players[0].ax, players[0].ay,
+                   players[1].ax, players[1].ay);
         }
 
-        angle += 0.15;
-        PosPacket r = p;
-        r.x = ax + 300.0f * (float)cos(angle);
-        r.y = ay + 300.0f * (float)sin(angle);
-        r.z = az;
-        sendto(s, (const char*)&r, sizeof(r), 0,
-               (sockaddr*)&from, fromLen);
-        printf("ghost seq=%u pos %.1f %.1f %.1f\n", r.seq, r.x, r.y, r.z);
+        for (auto& vp : players)
+        {
+            vp.angle += vp.speed;
+            PosPacket r = {};
+            r.magic = kMagic;
+            r.seq = vp.seq++;
+            r.playerId = vp.id;
+            r.x = vp.ax + vp.radius * (float)cos(vp.angle);
+            r.y = vp.ay + vp.radius * (float)sin(vp.angle);
+            r.z = vp.az;
+            sendto(s, (const char*)&r, sizeof(r), 0,
+                   (sockaddr*)&from, fromLen);
+            printf("player %u seq=%u pos %.1f %.1f %.1f\n",
+                   r.playerId, r.seq, r.x, r.y, r.z);
+        }
     }
 }
