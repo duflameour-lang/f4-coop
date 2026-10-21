@@ -17,8 +17,10 @@ cl /nologo /LD /std:c++17 /EHsc /O2 /W3 /I "..\f4se-0.6.23" src\main.cpp /Fe:f4-
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /EHsc /O2 /W3 /Fe:recv.exe tools\recv.cpp ws2_32.lib
 if errorlevel 1 exit /b 1
-del main.obj recv.obj f4-coop.exp f4-coop.lib >nul 2>&1
-echo built f4-coop.dll and recv.exe
+cl /nologo /std:c++17 /EHsc /O2 /W3 /Fe:client.exe tools\client.cpp ws2_32.lib
+if errorlevel 1 exit /b 1
+del main.obj recv.obj client.obj f4-coop.exp f4-coop.lib >nul 2>&1
+echo built f4-coop.dll, recv.exe and client.exe
 exit /b 0
 
 :nomsvc

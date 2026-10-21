@@ -23,6 +23,11 @@
 // remote player (id 0 is "self" and is never puppeted). The bot now
 // simulates two virtual players, so two clones must circle at once - the
 // N-players primitive for "everyone sees everyone".
+// v12 (Stage 6): host-authoritative relay. f4coop.ini in the game root
+// selects role=host (bind the port, receive clients, rebroadcast every
+// known position - including the host player's - to every peer) or
+// role=client (send own pos to the host, puppet everyone but self).
+// Default without an ini: client to 127.0.0.1:31337 (echo-bot tests).
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -106,6 +111,50 @@ static void logline(const char* fmt, ...)
     fclose(f);
 }
 
+// ---- config (f4coop.ini in the game root) -------------------------------
+struct Config
+{
+    bool isHost = false;          // default: client to 127.0.0.1 (bot tests)
+    unsigned int myId = 1;
+    unsigned short port = 31337;
+    char hostAddr[64] = "127.0.0.1";
+};
+static Config g_cfg;
+
+static void loadConfig()
+{
+    FILE* f = nullptr;
+    fopen_s(&f, "f4coop.ini", "r");
+    if (!f)
+    {
+        logline("[f4-coop] no f4coop.ini, defaults: client id=%u -> 127.0.0.1:%u",
+                g_cfg.myId, g_cfg.port);
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+    {
+        char key[32] = "", value[64] = "";
+        if (sscanf_s(line, " %31[^= \t\r\n] = %63s", key, 32, value, 64) != 2)
+            continue;
+        if (strcmp(key, "role") == 0)
+            g_cfg.isHost = (strcmp(value, "host") == 0);
+        else if (strcmp(key, "id") == 0)
+            g_cfg.myId = (unsigned int)strtoul(value, nullptr, 10);
+        else if (strcmp(key, "host") == 0)
+            strncpy_s(g_cfg.hostAddr, value, _TRUNCATE);
+        else if (strcmp(key, "port") == 0)
+        {
+            unsigned long p = strtoul(value, nullptr, 10);
+            if (p > 0 && p < 65536) g_cfg.port = (unsigned short)p;
+        }
+    }
+    fclose(f);
+    logline("[f4-coop] config: role=%s id=%u -> %s:%u",
+            g_cfg.isHost ? "host (listens)" : "client", g_cfg.myId,
+            g_cfg.isHost ? "any" : g_cfg.hostAddr, g_cfg.port);
+}
+
 // ---- UDP transport ------------------------------------------------------
 static SOCKET g_sock = INVALID_SOCKET;
 static sockaddr_in g_dest = {};
@@ -128,33 +177,42 @@ static bool udpInit()
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) return false;
 
-    // bind to an arbitrary source port so replies can come back to us
+    // host binds the well-known port; client binds an arbitrary source
+    // port so replies can come back to us
     sockaddr_in self = {};
     self.sin_family = AF_INET;
-    self.sin_port = 0;
+    self.sin_port = g_cfg.isHost ? htons(g_cfg.port) : 0;
     self.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(g_sock, (sockaddr*)&self, sizeof(self)) != 0) return false;
+    if (bind(g_sock, (sockaddr*)&self, sizeof(self)) != 0)
+    {
+        logline("[f4-coop] bind port %u FAILED (wsa=%d)",
+                g_cfg.port, WSAGetLastError());
+        return false;
+    }
 
     // non-blocking receive
     u_long nb = 1;
     ioctlsocket(g_sock, FIONBIO, &nb);
 
-    g_dest.sin_family = AF_INET;
-    g_dest.sin_port = htons(kPort);
-    inet_pton(AF_INET, "127.0.0.1", &g_dest.sin_addr);
+    if (!g_cfg.isHost)
+    {
+        g_dest.sin_family = AF_INET;
+        g_dest.sin_port = htons(g_cfg.port);
+        inet_pton(AF_INET, g_cfg.hostAddr, &g_dest.sin_addr);
+    }
     return true;
 }
 
-static void udpSendPos(float x, float y, float z)
+static void sendTo(const sockaddr_in& to, unsigned int id, float x, float y, float z)
 {
     if (g_sock == INVALID_SOCKET) return;
     PosPacket p;
     p.magic = kMagic;
     p.seq = g_seq++;
-    p.playerId = 0; // self
+    p.playerId = id;
     p.x = x; p.y = y; p.z = z;
     sendto(g_sock, (const char*)&p, sizeof(p), 0,
-           (sockaddr*)&g_dest, sizeof(g_dest));
+           (const sockaddr*)&to, sizeof(to));
 }
 
 // ---- ghost state: net thread writes, game thread applies ----------------
@@ -166,6 +224,15 @@ static std::mutex g_ghostLock;
 static std::map<unsigned int, GhostEntry> g_ghosts; // playerId -> pos
 static UInt64 g_ghostVersion = 0;                   // bumped on every store
 static std::atomic<bool> g_taskInFlight{false};
+
+// record a remote player's position for the game thread to puppet
+static void storeGhost(const PosPacket& p)
+{
+    if (p.playerId == g_cfg.myId) return; // never puppet self
+    std::lock_guard<std::mutex> lk(g_ghostLock);
+    g_ghostVersion++;
+    g_ghosts[p.playerId] = { p.x, p.y, p.z };
+}
 
 static void udpTryRecv()
 {
@@ -180,23 +247,96 @@ static void udpTryRecv()
                          (sockaddr*)&from, &fromLen);
         if (n != sizeof(p)) break; // nothing more (WSAEWOULDBLOCK)
         if (p.magic != kMagic) continue;
+        if (p.playerId == g_cfg.myId) continue;
 
         if (p.x != s_lastRxX)
         {
-            logline("[f4-coop] rx seq=%u pos %.1f %.1f %.1f",
-                    p.seq, p.x, p.y, p.z);
+            logline("[f4-coop] rx id=%u seq=%u pos %.1f %.1f %.1f",
+                    p.playerId, p.seq, p.x, p.y, p.z);
             s_lastRxX = p.x;
         }
 
-        // the net thread only records the latest position per player;
-        // the actual moves happen on the game thread (ApplyGhostMoveTask)
-        if (p.playerId == 0) continue; // our own echo - never puppet self
-        {
-            std::lock_guard<std::mutex> lk(g_ghostLock);
-            g_ghostVersion++;
-            g_ghosts[p.playerId] = { p.x, p.y, p.z };
-        }
+        storeGhost(p);
     }
+}
+
+// ---- host relay: receive clients, rebroadcast everyone to everyone ------
+struct Peer
+{
+    sockaddr_in addr;
+    unsigned int id;
+    unsigned long long lastSeen;
+};
+static std::vector<Peer> g_peers; // net thread only
+
+static void hostService(bool havePos, float x, float y, float z)
+{
+    // drain incoming
+    static float s_lastRxX = 1e30f;
+    for (int i = 0; i < 32; i++)
+    {
+        PosPacket p = {};
+        sockaddr_in from = {};
+        int fromLen = sizeof(from);
+        int n = recvfrom(g_sock, (char*)&p, sizeof(p), 0,
+                         (sockaddr*)&from, &fromLen);
+        if (n != sizeof(p)) break; // nothing more (WSAEWOULDBLOCK)
+        if (p.magic != kMagic || p.playerId == g_cfg.myId) continue;
+
+        bool known = false;
+        for (auto& pr : g_peers)
+        {
+            if (pr.addr.sin_addr.s_addr == from.sin_addr.s_addr &&
+                pr.addr.sin_port == from.sin_port)
+            {
+                known = true;
+                pr.lastSeen = GetTickCount64();
+                pr.id = p.playerId;
+                break;
+            }
+        }
+        if (!known)
+        {
+            Peer np = { from, p.playerId, GetTickCount64() };
+            g_peers.push_back(np);
+            logline("[f4-coop] peer joined: id=%u", p.playerId);
+        }
+
+        if (p.x != s_lastRxX)
+        {
+            logline("[f4-coop] rx id=%u seq=%u pos %.1f %.1f %.1f",
+                    p.playerId, p.seq, p.x, p.y, p.z);
+            s_lastRxX = p.x;
+        }
+
+        storeGhost(p);
+    }
+
+    // drop peers silent for 5 s
+    unsigned long long now = GetTickCount64();
+    for (size_t i = 0; i < g_peers.size(); )
+    {
+        if (now - g_peers[i].lastSeen > 5000)
+        {
+            logline("[f4-coop] peer left: id=%u", g_peers[i].id);
+            g_peers.erase(g_peers.begin() + i);
+        }
+        else ++i;
+    }
+
+    if (!havePos || g_peers.empty()) return;
+
+    // broadcast the host player + every known remote to every peer
+    std::vector<std::pair<unsigned int, GhostEntry>> snap;
+    snap.push_back(std::make_pair(g_cfg.myId, GhostEntry{ x, y, z }));
+    {
+        std::lock_guard<std::mutex> lk(g_ghostLock);
+        for (auto& kv : g_ghosts)
+            snap.push_back(kv);
+    }
+    for (auto& pr : g_peers)
+        for (auto& s : snap)
+            sendTo(pr.addr, s.first, s.second.x, s.second.y, s.second.z);
 }
 
 // Runs on the game thread: F4SE pumps tasks from a hook inside the engine's
@@ -384,15 +524,30 @@ static void positionThreadMain()
     for (;;)
     {
         Sleep(100);
-        if (!g_worldLoaded) continue;
-        void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
-        if (!player) continue;
-        float x = *(float*)((char*)player + kPosOffset);
-        float y = *(float*)((char*)player + kPosOffset + 4);
-        float z = *(float*)((char*)player + kPosOffset + 8);
 
-        udpSendPos(x, y, z);
-        udpTryRecv();
+        float x = 0.f, y = 0.f, z = 0.f;
+        bool havePos = false;
+        if (g_worldLoaded)
+        {
+            void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
+            if (player)
+            {
+                x = *(float*)((char*)player + kPosOffset);
+                y = *(float*)((char*)player + kPosOffset + 4);
+                z = *(float*)((char*)player + kPosOffset + 8);
+                havePos = true;
+            }
+        }
+
+        // host services the socket even in menus so peers can join;
+        // clients only talk once they have a position to send
+        if (g_cfg.isHost)
+            hostService(havePos, x, y, z);
+        else if (havePos)
+        {
+            sendTo(g_dest, g_cfg.myId, x, y, z);
+            udpTryRecv();
+        }
 
         // post at most one apply task at a time, and only on fresh data
         UInt64 version;
@@ -418,13 +573,16 @@ static void positionThreadMain()
             g_tasks->AddTask(new ApplyGhostMoveTask());
         }
 
-        float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
-        bool moved = !haveLast || (fabsf(dx) + fabsf(dy) + fabsf(dz)) > 0.5f;
-        if (moved)
+        if (havePos)
         {
-            logline("[f4-coop] pos %.1f %.1f %.1f", x, y, z);
-            lastX = x; lastY = y; lastZ = z;
-            haveLast = true;
+            float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
+            bool moved = !haveLast || (fabsf(dx) + fabsf(dy) + fabsf(dz)) > 0.5f;
+            if (moved)
+            {
+                logline("[f4-coop] pos %.1f %.1f %.1f", x, y, z);
+                lastX = x; lastY = y; lastZ = z;
+                haveLast = true;
+            }
         }
     }
 }
@@ -436,7 +594,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 11;
+        info->version     = 12;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -464,14 +622,19 @@ extern "C"
         if (!g_tasks)
             logline("[f4-coop] no task interface - ghost apply disabled");
 
+        loadConfig();
+
         if (!udpInit())
             logline("[f4-coop] udp init FAILED (wsa=%d)", WSAGetLastError());
+        else if (g_cfg.isHost)
+            logline("[f4-coop] host relay listening on %u", g_cfg.port);
         else
-            logline("[f4-coop] udp bound, sending to 127.0.0.1:%u", kPort);
+            logline("[f4-coop] client sending to %s:%u",
+                    g_cfg.hostAddr, g_cfg.port);
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v11, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v12, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
