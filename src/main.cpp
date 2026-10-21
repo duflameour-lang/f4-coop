@@ -1,5 +1,8 @@
-// f4-coop - Stage 3, step A: network-controlled self position (puppet test).
+// f4-coop - Stage 3, step B: network-controlled self position via the
+// engine's own move (MoveRefrToPosition, the native behind Papyrus MoveTo),
+// applied on the game thread through F4SE's task interface.
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
+typedef unsigned char UInt8;
 typedef unsigned int UInt32;
 typedef unsigned long long UInt64;
 
@@ -10,21 +13,35 @@ typedef unsigned long long UInt64;
 #include <ws2tcpip.h>
 #include <windows.h>
 
+// after windows.h: GameThreads.h needs CRITICAL_SECTION/HANDLE
+#include "f4se/GameThreads.h" // ITaskDelegate
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 static PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 static F4SEMessagingInterface* g_messaging = nullptr;
+static F4SETaskInterface* g_tasks = nullptr;
 static std::atomic<bool> g_worldLoaded{false};
 static uintptr_t g_gameBase = 0;
 
-// Offsets verified against ianpatt/f4se tag v0.6.23.
-static const uintptr_t kPlayerPtrOffset = 0x05AA4388;
-static const uintptr_t kPosOffset = 0xD0;
+// Offsets verified against ianpatt/f4se tag v0.6.23 (RelocAddr/RelocPtr
+// convention: runtime address = module base + offset).
+static const uintptr_t kPlayerPtrOffset     = 0x05AA4388; // g_player
+static const uintptr_t kParentCellOffset    = 0xB8;       // TESObjectREFR::parentCell
+static const uintptr_t kPosOffset           = 0xD0;       // TESObjectREFR::pos
+static const uintptr_t kInvalidHandleOffset = 0x038CCE04; // g_invalidRefHandle
+static const uintptr_t kMoveRefrOffset      = 0x013FE7E0; // MoveRefrToPosition
+static const uintptr_t kGetWorldspaceOffset = 0x0040F290; // TESObjectREFR::GetWorldspace
+
+typedef void (*_MoveRefrToPosition)(void* source, UInt32* pTargetHandle,
+    void* parentCell, void* worldSpace, float* position, float* rotation);
+typedef void* (*_GetWorldspace)(void* refr);
 
 // ---- logging ------------------------------------------------------------
 static void logline(const char* fmt, ...)
@@ -88,6 +105,16 @@ static void udpSendPos(float x, float y, float z)
            (sockaddr*)&g_dest, sizeof(g_dest));
 }
 
+// ---- ghost state: net thread writes, game thread applies ----------------
+struct GhostState
+{
+    UInt64 version; // bumped on every store, 0 = nothing yet
+    float x, y, z;
+};
+static std::mutex g_ghostLock;
+static GhostState g_ghost = {};
+static std::atomic<bool> g_taskInFlight{false};
+
 static void udpTryRecv()
 {
     if (g_sock == INVALID_SOCKET) return;
@@ -109,14 +136,73 @@ static void udpTryRecv()
             s_lastRxX = p.x;
         }
 
-        // Stage 3A test: received position controls SELF.
-        // Copies x,y,z (12 bytes) into the local player's pos field.
-        // The ghost bot orbits, so the player is dragged in a circle.
-        void* me = *(void**)(g_gameBase + kPlayerPtrOffset);
-        if (me)
-            memcpy((char*)me + kPosOffset, &p.x, 12);
+        // Stage 3B: the net thread only records the latest ghost position;
+        // the actual move happens on the game thread (ApplyGhostMoveTask).
+        {
+            std::lock_guard<std::mutex> lk(g_ghostLock);
+            g_ghost.version++;
+            g_ghost.x = p.x; g_ghost.y = p.y; g_ghost.z = p.z;
+        }
     }
 }
+
+// Runs on the game thread: F4SE pumps tasks from a hook inside the engine's
+// message queue processing (Hooks_Threads.cpp), i.e. the main update loop.
+// Call pattern mirrors f4se/PapyrusObjectReference.cpp ConnectObjects:
+// nullHandle + own parentCell + GetWorldspace().
+class ApplyGhostMoveTask : public ITaskDelegate
+{
+public:
+    void Run() override
+    {
+        g_taskInFlight = false; // a fresh task may be posted from here on
+
+        GhostState g;
+        {
+            std::lock_guard<std::mutex> lk(g_ghostLock);
+            g = g_ghost;
+        }
+        if (g.version == 0) return;
+        if (fabsf(g.x) > 1e6f || fabsf(g.y) > 1e6f || fabsf(g.z) > 1e6f)
+            return; // sanity: never teleport to garbage
+
+        void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
+        if (!player) return;
+        void* parentCell = *(void**)((char*)player + kParentCellOffset);
+        if (!parentCell) return;
+
+        _GetWorldspace getWorldspace =
+            (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
+        void* worldspace = getWorldspace(player);
+
+        // face the direction of movement (euler Z rotation, radians)
+        float cur[3];
+        memcpy(cur, (char*)player + kPosOffset, sizeof(cur));
+        float rot[3] = { 0.f, 0.f, atan2f(g.y - cur[1], g.x - cur[0]) };
+        float pos[3] = { g.x, g.y, g.z };
+
+        UInt32 nullHandle = *(UInt32*)(g_gameBase + kInvalidHandleOffset);
+        _MoveRefrToPosition moveRefr =
+            (_MoveRefrToPosition)(g_gameBase + kMoveRefrOffset);
+
+        static std::atomic<UInt64> s_moves{0};
+        UInt64 n = ++s_moves;
+        bool logIt = (n <= 5 || n % 50 == 0);
+        if (logIt)
+            logline("[f4-coop] moveRefr #%llu -> %.1f %.1f %.1f (cell=%p ws=%p)",
+                    (unsigned long long)n, g.x, g.y, g.z, parentCell, worldspace);
+
+        moveRefr(player, &nullHandle, parentCell, worldspace, pos, rot);
+
+        if (logIt)
+        {
+            float after[3];
+            memcpy(after, (char*)player + kPosOffset, sizeof(after));
+            logline("[f4-coop] move #%llu done, pos now %.1f %.1f %.1f",
+                    (unsigned long long)n, after[0], after[1], after[2]);
+        }
+    }
+};
 // -------------------------------------------------------------------------
 
 static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
@@ -134,6 +220,7 @@ static void positionThreadMain()
 {
     float lastX = 0.0f, lastY = 0.0f, lastZ = 0.0f;
     bool haveLast = false;
+    UInt64 lastPosted = 0;
     for (;;)
     {
         Sleep(100);
@@ -146,6 +233,19 @@ static void positionThreadMain()
 
         udpSendPos(x, y, z);
         udpTryRecv();
+
+        // post at most one apply task at a time, and only on fresh data
+        UInt64 version;
+        {
+            std::lock_guard<std::mutex> lk(g_ghostLock);
+            version = g_ghost.version;
+        }
+        if (version != lastPosted && g_tasks &&
+            !g_taskInFlight.exchange(true))
+        {
+            lastPosted = version;
+            g_tasks->AddTask(new ApplyGhostMoveTask());
+        }
 
         float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
         bool moved = !haveLast || (fabsf(dx) + fabsf(dy) + fabsf(dz)) > 0.5f;
@@ -165,7 +265,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 5;
+        info->version     = 6;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -189,6 +289,10 @@ extern "C"
         g_messaging->RegisterListener(g_pluginHandle, "F4SE", onF4SEMessage);
         g_gameBase = (uintptr_t)GetModuleHandle(NULL);
 
+        g_tasks = (F4SETaskInterface*)f4se->QueryInterface(kInterface_Task);
+        if (!g_tasks)
+            logline("[f4-coop] no task interface - ghost apply disabled");
+
         if (!udpInit())
             logline("[f4-coop] udp init FAILED (wsa=%d)", WSAGetLastError());
         else
@@ -196,7 +300,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v5, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v6, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }

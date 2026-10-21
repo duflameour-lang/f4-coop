@@ -49,6 +49,10 @@ int main()
 
         if (!haveAnchor)
         {
+            // skip the pre-load placeholder the plugin emits right after
+            // world load (player object exists before being placed)
+            if (p.x == 2048.0f && p.y == 2048.0f && p.z == 0.0f)
+                continue;
             ax = p.x + 500.0f;
             ay = p.y;
             az = p.z;
