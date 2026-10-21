@@ -4,6 +4,8 @@
 // v7: moves are gated on the save-load lifecycle (PostLoadGame arms,
 // PreLoadGame disarms) and on UI pause mode (loading screens, Pip-Boy):
 // applying moves during save load hangs the load screen forever.
+// v8: PostLoadGame bool is value-encoded in msg->data - never dereference
+// it (v7 crashed the game on every save load).
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -251,6 +253,8 @@ public:
 
 static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
 {
+    // kMessage_GameDataReady also value-encodes its bool as the data
+    // pointer (Hooks_GameData.cpp:29) - non-null check only, no deref.
     if (msg->type == F4SEMessagingInterface::kMessage_GameDataReady && msg->data)
         logline("[f4-coop] GameDataReady");
     if (msg->type == F4SEMessagingInterface::kMessage_GameLoaded)
@@ -265,7 +269,11 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
     }
     if (msg->type == F4SEMessagingInterface::kMessage_PostLoadGame)
     {
-        bool ok = msg->data ? *(bool*)msg->data : false;
+        // F4SE dispatches this with data = (void*)result - the bool is
+        // value-encoded as the pointer itself (Hooks_SaveLoad.cpp:51),
+        // NOT a pointer to a bool. Never dereference msg->data here
+        // (v7 did and crashed the game on every save load).
+        bool ok = (msg->data != nullptr);
         logline("[f4-coop] PostLoadGame ok=%d - apply %s", ok,
                 ok ? "armed" : "disabled");
         g_applyArmed = ok;
@@ -326,7 +334,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 7;
+        info->version     = 8;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -361,7 +369,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v7, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v8, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
