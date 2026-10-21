@@ -28,6 +28,10 @@
 // known position - including the host player's - to every peer) or
 // role=client (send own pos to the host, puppet everyone but self).
 // Default without an ini: client to 127.0.0.1:31337 (echo-bot tests).
+// v13: puppet death handling. v12 kept MoveRefrToPosition-ing a killed
+// puppet - the corpse kept circling (owner observed). Now each move
+// checks the actor life state first; a dead puppet is abandoned (corpse
+// left alone) and a fresh one respawns after a rate-limited delay.
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -84,6 +88,15 @@ static const float kMaxDragDist = 5000.0f;
 // must finish undisturbed or the loading screen never dismisses
 static const unsigned kArmGraceMs = 10000;
 
+// after a puppet dies: minimum delay before its replacement may spawn
+// (rate limit so a wrong death check cannot produce a clone army)
+static const unsigned kRespawnDelayMs = 5000;
+
+// ActorState is at Actor+0x128; unk08 within it (+0x130 from the actor)
+// is the life state per Creation lineage: 0 = alive, >= 3 dying/dead.
+// Hypothesis - the log prints observed values so a wrong guess is visible.
+static const uintptr_t kLifeStateOffset = 0x130;
+
 typedef void (*_MoveRefrToPosition)(void* source, UInt32* pTargetHandle,
     void* parentCell, void* worldSpace, float* position, float* rotation);
 typedef void* (*_GetWorldspace)(void* refr);
@@ -93,6 +106,7 @@ typedef void* (*_PlaceAtMe_Native)(void* vm, UInt32 stackId, void** target,
 
 // one driven NPC per remote playerId; game-thread only (Run + load events)
 static std::map<unsigned int, void*> g_puppets;
+static std::map<unsigned int, unsigned long long> g_respawnOkAt; // game thread
 
 // ---- logging ------------------------------------------------------------
 static void logline(const char* fmt, ...)
@@ -420,11 +434,30 @@ public:
                 }
                 s_spawnFails = 0;
                 g_puppets[gh.first] = puppet;
-                logline("[f4-coop] puppet %u spawned: %p", gh.first, puppet);
+                logline("[f4-coop] puppet %u spawned: %p lifeState=%u",
+                        gh.first, puppet,
+                        *(UInt32*)((char*)puppet + kLifeStateOffset));
             }
 
             void* parentCell = *(void**)((char*)puppet + kParentCellOffset);
             if (!parentCell) continue;
+
+            // alive check: stop driving a killed puppet - the corpse
+            // would otherwise keep following the network positions
+            UInt32 lifeState = *(UInt32*)((char*)puppet + kLifeStateOffset);
+            if (lifeState >= 3)
+            {
+                unsigned long long now = GetTickCount64();
+                unsigned long long& okAt = g_respawnOkAt[gh.first];
+                if (now >= okAt)
+                {
+                    okAt = now + kRespawnDelayMs;
+                    g_puppets.erase(gh.first);
+                    logline("[f4-coop] puppet %u dead (lifeState=%u) - abandoned, respawn in %u ms",
+                            gh.first, lifeState, kRespawnDelayMs);
+                }
+                continue;
+            }
 
             _GetWorldspace getWorldspace =
                 (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
@@ -594,7 +627,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 12;
+        info->version     = 13;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -634,7 +667,7 @@ extern "C"
 
         std::thread t(positionThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v12, handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v13, handle=%u runtime=0x%08X",
                 g_pluginHandle, f4se->runtimeVersion);
         return true;
     }
