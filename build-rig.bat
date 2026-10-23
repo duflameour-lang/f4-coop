@@ -38,9 +38,14 @@ cl /nologo /std:c++latest /EHsc /O2 /W3 /Ivendor\f4mp\common /Ivendor\enet-1.3.1
    /Fe:build\F4MPBot.exe /link build\enet-1.3.18.lib ws2_32.lib winmm.lib
 if errorlevel 1 exit /b 1
 
+rem ---- address library dump tool ----
+cl /nologo /std:c++latest /EHsc /O2 /W3 /Fe:build\aldump.exe tools\aldump.c
+if errorlevel 1 exit /b 1
+
 del vendor\f4mp\common\*.obj 2>nul
 del vendor\f4mp\server\*.obj vendor\f4mp\bot\*.obj 2>nul
-echo built build\F4MPServer.exe and build\F4MPBot.exe
+del tools\aldump.obj 2>nul
+echo built build\F4MPServer.exe, build\F4MPBot.exe and build\aldump.exe
 exit /b 0
 
 :nomsvc
