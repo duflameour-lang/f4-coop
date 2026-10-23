@@ -4,6 +4,13 @@
 // its own PlayerState at 10 Hz, and drives one puppet per remote player
 // from kPlayerStates relays. Legacy net = our raw-UDP relay stays as a
 // fallback (net = legacy).
+// v16: the menu/pause gate no longer blocks puppet spawn/move (it was
+// meant for loading screens, but numPauseGame never sees those - v8 -
+// and loads are already covered by the armed+grace gates; blocking on
+// real menus kept puppets from ever appearing while the owner checked
+// the bot consoles with the game paused). It now only LOGS pauses.
+// A 5-second status heartbeat (welcomed, states heard, ghosts, puppets,
+// tasks) makes silent failures impossible to miss.
 // History: v6 MoveRefrToPosition; v7 msg-data bool crash fix; v8/v9
 // load-lifecycle gates + grace; v10 puppet-not-player; v11 playerId;
 // v12 host relay; v13/v14 death-check lesson (field is flags, not state).
@@ -375,21 +382,22 @@ public:
         void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
         if (!player) return;
 
-        // never move while a menu/loading screen is up (UI::numPauseGame,
-        // "isInMenuMode" per GameMenus.h). Moving during a load screen
-        // restarts cell streaming and hangs the load forever (v6/v8).
+        // menu/pause is OBSERVED, not enforced: numPauseGame never sees
+        // loading screens (v8) - loads are guarded by armed+grace above -
+        // and puppet moves during real menus are safe (v14 worked through
+        // them). v15's blocking gate kept puppets from ever appearing
+        // while the game sat paused (owner alt-tabbing to bot consoles).
         void* ui = *(void**)(g_gameBase + kUiSingletonOffset);
-        if (!ui) return;
-        UInt32 pauseCount = *(UInt32*)((char*)ui + kUiPauseCountOffset);
-        static std::atomic<bool> s_menuBlockLogged{false};
+        UInt32 pauseCount = ui
+            ? *(UInt32*)((char*)ui + kUiPauseCountOffset) : 0;
+        static std::atomic<bool> s_menuLogged{false};
         if (pauseCount != 0)
         {
-            if (!s_menuBlockLogged.exchange(true))
-                logline("[f4-coop] blocked: menu/pause mode (pauseCount=%u)",
+            if (!s_menuLogged.exchange(true))
+                logline("[f4-coop] note: menu/pause open (pauseCount=%u) - moves continue",
                         pauseCount);
-            return;
         }
-        s_menuBlockLogged = false;
+        else s_menuLogged = false;
 
         for (auto& gh : ghosts)
         {
@@ -495,6 +503,9 @@ struct F4mpClient
 {
     std::atomic<bool> welcomed{false};
     std::atomic<unsigned int> myPlayerId{0};
+    std::atomic<unsigned long long> statesHeard{0};  // kPlayerStates entries
+    std::atomic<unsigned long long> tasksPosted{0};
+    std::atomic<unsigned long long> joinedSeen{0};
 };
 static F4mpClient g_f4mp;
 
@@ -518,8 +529,11 @@ static void f4mpHandlePacket(std::span<const std::uint8_t> a_data)
         break;
     case MessageType::kPlayerJoined:
         if (const auto msg = DecodePlayerJoined(a_data))
+        {
+            g_f4mp.joinedSeen++;
             logline("[f4-coop] player %u joined: %s",
                     msg->playerId, msg->name.c_str());
+        }
         break;
     case MessageType::kPlayerLeft:
         if (const auto msg = DecodePlayerLeft(a_data))
@@ -536,6 +550,7 @@ static void f4mpHandlePacket(std::span<const std::uint8_t> a_data)
             for (const auto& rs : msg->players)
             {
                 if (rs.playerId == g_f4mp.myPlayerId.load()) continue;
+                g_f4mp.statesHeard++;
                 std::lock_guard<std::mutex> lk(g_ghostLock);
                 g_ghostVersion++;
                 g_ghosts[rs.playerId] = { rs.state.x, rs.state.y, rs.state.z,
@@ -672,9 +687,11 @@ static void f4mpThreadMain()
 
         // post at most one apply task at a time, and only on fresh data
         UInt64 version;
+        size_t ghostCount;
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
             version = g_ghostVersion;
+            ghostCount = g_ghosts.size();
         }
         bool armedNow =
             g_applyArmed && g_f4mp.welcomed &&
@@ -691,7 +708,24 @@ static void f4mpThreadMain()
             !g_taskInFlight.exchange(true))
         {
             lastPosted = version;
+            g_f4mp.tasksPosted++;
             g_tasks->AddTask(new ApplyGhostMoveTask());
+        }
+
+        // heartbeat every 5 s: if this stops printing, the net thread died;
+        // if statesHeard stays 0, relays are not reaching us; if ghosts stay
+        // empty, our filter is eating them. No more silent nothing.
+        static Clock::time_point nextBeat{};
+        if (now >= nextBeat)
+        {
+            nextBeat = now + std::chrono::seconds(5);
+            logline("[f4-coop] beat: welcomed=%d myId=%u states=%llu ghosts=%zu tasks=%llu joined=%u",
+                    g_f4mp.welcomed.load() ? 1 : 0,
+                    g_f4mp.myPlayerId.load(),
+                    (unsigned long long)g_f4mp.statesHeard.load(),
+                    ghostCount,
+                    (unsigned long long)g_f4mp.tasksPosted.load(),
+                    (unsigned)g_f4mp.joinedSeen.load());
         }
     }
 }
@@ -810,7 +844,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 15;
+        info->version     = 16;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -842,7 +876,7 @@ extern "C"
 
         std::thread t(g_cfg.isF4mp ? f4mpThreadMain : legacyThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v15 (net=%s), handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v16 (net=%s), handle=%u runtime=0x%08X",
                 g_cfg.isF4mp ? "f4mp" : "legacy", g_pluginHandle,
                 f4se->runtimeVersion);
         return true;
