@@ -612,10 +612,18 @@ static void f4mpThreadMain()
             nextConnect = now + std::chrono::seconds(3);
         }
 
-        // service the connection (up to 100 ms) - this is our loop tick
+        // service the connection. The first call waits up to 5 ms and the
+        // rest drain without waiting, bounded to 64 events: with a large
+        // timeout (v16 used 100 ms) and a steady ~30 Hz state stream (a
+        // packet every ~35 ms), the inner loop NEVER went idle and the
+        // rest of this loop - our own 10 Hz sends, task posting, the
+        // heartbeat - starved for minutes (v16 log, 21:38-21:44). The
+        // upstream bot avoids this with a 5 ms timeout; we do the same.
         ENetEvent event;
-        while (peer && enet_host_service(host, &event, 100) > 0)
+        for (int drained = 0; drained < 64 && peer; ++drained)
         {
+            if (enet_host_service(host, &event, drained == 0 ? 5 : 0) <= 0)
+                break;
             switch (event.type)
             {
             case ENET_EVENT_TYPE_CONNECT:
@@ -844,7 +852,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 16;
+        info->version     = 17;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -876,7 +884,7 @@ extern "C"
 
         std::thread t(g_cfg.isF4mp ? f4mpThreadMain : legacyThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v16 (net=%s), handle=%u runtime=0x%08X",
+        logline("[f4-coop] loaded v17 (net=%s), handle=%u runtime=0x%08X",
                 g_cfg.isF4mp ? "f4mp" : "legacy", g_pluginHandle,
                 f4se->runtimeVersion);
         return true;
