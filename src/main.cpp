@@ -137,7 +137,7 @@ static void loadConfig()
         if (sscanf_s(line, " %31[^= \t\r\n] = %63s", key, 32, value, 64) != 2)
             continue;
         if (strcmp(key, "net") == 0)
-            g_cfg.isF4mp = (strcmp(value, "f4mp") != 0); // default f4mp
+            g_cfg.isF4mp = (strcmp(value, "f4mp") == 0);
         else if (strcmp(key, "server") == 0)
             strncpy_s(g_cfg.server, value, _TRUNCATE);
         else if (strcmp(key, "name") == 0)
