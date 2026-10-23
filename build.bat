@@ -13,13 +13,20 @@ if not defined VSPATH goto nomsvc
 call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
 
 :build
-cl /nologo /LD /std:c++17 /EHsc /O2 /W3 /I "..\f4se-0.6.23" src\main.cpp /Fe:f4-coop.dll /link ws2_32.lib
+if not exist build\enet-1.3.18.lib (
+    echo ERROR: build\enet-1.3.18.lib missing - run build-rig.bat first
+    exit /b 1
+)
+cl /nologo /LD /std:c++latest /EHsc /O2 /W3 /I "..\f4se-0.6.23" /I "vendor\f4mp\common" /I "vendor\enet-1.3.18\include" ^
+   src\main.cpp vendor\f4mp\common\Net.cpp /Fe:f4-coop.dll ^
+   /link build\enet-1.3.18.lib ws2_32.lib winmm.lib
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /EHsc /O2 /W3 /Fe:recv.exe tools\recv.cpp ws2_32.lib
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /EHsc /O2 /W3 /Fe:client.exe tools\client.cpp ws2_32.lib
 if errorlevel 1 exit /b 1
 del main.obj recv.obj client.obj f4-coop.exp f4-coop.lib >nul 2>&1
+del vendor\f4mp\common\Net.obj >nul 2>&1
 echo built f4-coop.dll, recv.exe and client.exe
 exit /b 0
 

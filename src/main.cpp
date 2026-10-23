@@ -1,41 +1,12 @@
-// f4-coop - Stage 3, step B: network-controlled self position via the
-// engine's own move (MoveRefrToPosition, the native behind Papyrus MoveTo),
-// applied on the game thread through F4SE's task interface.
-// v7: moves are gated on the save-load lifecycle (PostLoadGame arms,
-// PreLoadGame disarms) and on UI pause mode (loading screens, Pip-Boy):
-// applying moves during save load hangs the load screen forever.
-// v8: PostLoadGame bool is value-encoded in msg->data - never dereference
-// it (v7 crashed the game on every save load).
-// v9: after PostLoadGame, applying waits out a grace period: the loading
-// screen is not detected by UI::numPauseGame (v8 log: zero blocked lines,
-// moves ran while the load screen was stuck), and moving the player during
-// load restarts cell streaming and hangs the screen forever.
-// v10 (Stage 4): the network no longer moves the PLAYER. A one-time puppet
-// NPC (spawned via PlaceAtMe from the player's own base form) is what
-// circles - the actual co-op architecture. Reason: v9 proved the load
-// completes and the world is live, but the first player MoveRefrToPosition
-// in a live game triggers a loading screen (535-unit same-cell move!)
-// which our moves then keep re-triggering. NPCs take a well-trodden path
-// (companion tracking uses the same move); the player-specific load path is
-// a rabbit hole the mod does not need: local players are driven by local
-// input, only puppets move by network.
-// v11 (Stage 5): protocol v2 - packets carry a playerId; one puppet per
-// remote player (id 0 is "self" and is never puppeted). The bot now
-// simulates two virtual players, so two clones must circle at once - the
-// N-players primitive for "everyone sees everyone".
-// v12 (Stage 6): host-authoritative relay. f4coop.ini in the game root
-// selects role=host (bind the port, receive clients, rebroadcast every
-// known position - including the host player's - to every peer) or
-// role=client (send own pos to the host, puppet everyone but self).
-// Default without an ini: client to 127.0.0.1:31337 (echo-bot tests).
-// v13: puppet death handling. v12 kept MoveRefrToPosition-ing a killed
-// puppet - the corpse kept circling (owner observed). v13 guessed a life
-// state field at Actor+0x130 - WRONG: it is flags (0x80000000 living,
-// occasionally 0x80000041), every living puppet read as dead and the
-// rate-limited respawn produced a standing clone army. v14 removes the
-// gate (killed puppets' corpses will circle again - do not shoot them in
-// tests); real death detection needs RE of Actor::IsDead/GetLifeState.
-// The spawn line still logs the field for future RE data.
+// f4-coop - F4SE plugin: co-op presence for Fallout 4 1.10.163 (pre-NG).
+// v15: net = f4mp mode - the plugin is an F4Multiplayer protocol client
+// (vendored common/Protocol.h + ENet): connects to an F4MPServer, sends
+// its own PlayerState at 10 Hz, and drives one puppet per remote player
+// from kPlayerStates relays. Legacy net = our raw-UDP relay stays as a
+// fallback (net = legacy).
+// History: v6 MoveRefrToPosition; v7 msg-data bool crash fix; v8/v9
+// load-lifecycle gates + grace; v10 puppet-not-player; v11 playerId;
+// v12 host relay; v13/v14 death-check lesson (field is flags, not state).
 // Target: Fallout 4 1.10.163.0, F4SE 0.6.23.
 typedef unsigned char UInt8;
 typedef unsigned int UInt32;
@@ -51,7 +22,14 @@ typedef unsigned long long UInt64;
 // after windows.h: GameThreads.h needs CRITICAL_SECTION/HANDLE
 #include "f4se/GameThreads.h" // ITaskDelegate
 
+// F4MP protocol client (vendored, GPL-3+exceptions - see README)
+#include "Protocol.h"
+#include "Net.h"
+
+#include <enet/enet.h>
+
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
@@ -74,16 +52,22 @@ static uintptr_t g_gameBase = 0;
 // convention: runtime address = module base + offset).
 static const uintptr_t kPlayerPtrOffset     = 0x05AA4388; // g_player
 static const uintptr_t kParentCellOffset    = 0xB8;       // TESObjectREFR::parentCell
-static const uintptr_t kPosOffset           = 0xD0;       // TESObjectREFR::pos
-static const uintptr_t kInvalidHandleOffset = 0x038CCE04; // g_invalidRefHandle
+static const uintptr_t kRotOffset            = 0xC0;       // TESObjectREFR::rot (euler, radians)
+static const uintptr_t kPosOffset            = 0xD0;       // TESObjectREFR::pos
+static const uintptr_t kFormIDOffset         = 0x14;       // TESForm::formID
+static const uintptr_t kBaseFormOffset       = 0xE0;       // TESObjectREFR::baseForm
+static const uintptr_t kInvalidHandleOffset  = 0x038CCE04; // g_invalidRefHandle
 static const uintptr_t kMoveRefrOffset      = 0x013FE7E0; // MoveRefrToPosition
 static const uintptr_t kGetWorldspaceOffset = 0x0040F290; // TESObjectREFR::GetWorldspace
-static const uintptr_t kUiSingletonOffset   = 0x058D0898; // g_ui
-static const uintptr_t kUiPauseCountOffset  = 0x1E0;      // UI::numPauseGame
-static const uintptr_t kBaseFormOffset       = 0xE0;       // TESObjectREFR::baseForm
 static const uintptr_t kGameVMOffset         = 0x058D3308; // g_gameVM
 static const uintptr_t kVMOffset             = 0xB0;       // GameVM::m_virtualMachine
 static const uintptr_t kPlaceAtMeOffset      = 0x0140B0E0; // PlaceAtMe_Native
+static const uintptr_t kUiSingletonOffset   = 0x058D0898; // g_ui
+static const uintptr_t kUiPauseCountOffset  = 0x1E0;      // UI::numPauseGame
+
+// NOT a life state (v13 lesson): flags-like field at Actor+0x130;
+// 0x80000000 for living actors. Logged at spawn for future RE.
+static const uintptr_t kLifeStateOffset = 0x130;
 
 // safety: never drag the player farther than this in one move (units)
 static const float kMaxDragDist = 5000.0f;
@@ -92,10 +76,6 @@ static const float kMaxDragDist = 5000.0f;
 // must finish undisturbed or the loading screen never dismisses
 static const unsigned kArmGraceMs = 10000;
 
-// NOT a life state (v13 lesson): flags-like field at Actor+0x130;
-// 0x80000000 for living actors. Logged at spawn for future RE.
-static const uintptr_t kLifeStateOffset = 0x130;
-
 typedef void (*_MoveRefrToPosition)(void* source, UInt32* pTargetHandle,
     void* parentCell, void* worldSpace, float* position, float* rotation);
 typedef void* (*_GetWorldspace)(void* refr);
@@ -103,8 +83,10 @@ typedef void* (*_PlaceAtMe_Native)(void* vm, UInt32 stackId, void** target,
     void* form, int count, bool forcePersist, bool initiallyDisabled,
     bool deleteWhenAble);
 
-// one driven NPC per remote playerId; game-thread only (Run + load events)
-static std::map<unsigned int, void*> g_puppets;
+static unsigned int formIDOf(const void* form)
+{
+    return form ? *(const unsigned int*)((const char*)form + kFormIDOffset) : 0;
+}
 
 // ---- logging ------------------------------------------------------------
 static void logline(const char* fmt, ...)
@@ -126,7 +108,12 @@ static void logline(const char* fmt, ...)
 // ---- config (f4coop.ini in the game root) -------------------------------
 struct Config
 {
-    bool isHost = false;          // default: client to 127.0.0.1 (bot tests)
+    bool isF4mp = true;             // net = f4mp | legacy
+    // f4mp mode:
+    char server[64] = "127.0.0.1:7779";
+    char name[32] = "Player";
+    // legacy mode:
+    bool isHost = false;
     unsigned int myId = 1;
     unsigned short port = 31337;
     char hostAddr[64] = "127.0.0.1";
@@ -139,8 +126,8 @@ static void loadConfig()
     fopen_s(&f, "f4coop.ini", "r");
     if (!f)
     {
-        logline("[f4-coop] no f4coop.ini, defaults: client id=%u -> 127.0.0.1:%u",
-                g_cfg.myId, g_cfg.port);
+        logline("[f4-coop] no f4coop.ini, defaults: net=f4mp -> %s",
+                g_cfg.server);
         return;
     }
     char line[256];
@@ -149,7 +136,13 @@ static void loadConfig()
         char key[32] = "", value[64] = "";
         if (sscanf_s(line, " %31[^= \t\r\n] = %63s", key, 32, value, 64) != 2)
             continue;
-        if (strcmp(key, "role") == 0)
+        if (strcmp(key, "net") == 0)
+            g_cfg.isF4mp = (strcmp(value, "f4mp") != 0); // default f4mp
+        else if (strcmp(key, "server") == 0)
+            strncpy_s(g_cfg.server, value, _TRUNCATE);
+        else if (strcmp(key, "name") == 0)
+            strncpy_s(g_cfg.name, value, _TRUNCATE);
+        else if (strcmp(key, "role") == 0)
             g_cfg.isHost = (strcmp(value, "host") == 0);
         else if (strcmp(key, "id") == 0)
             g_cfg.myId = (unsigned int)strtoul(value, nullptr, 10);
@@ -162,12 +155,31 @@ static void loadConfig()
         }
     }
     fclose(f);
-    logline("[f4-coop] config: role=%s id=%u -> %s:%u",
-            g_cfg.isHost ? "host (listens)" : "client", g_cfg.myId,
-            g_cfg.isHost ? "any" : g_cfg.hostAddr, g_cfg.port);
+    if (g_cfg.isF4mp)
+        logline("[f4-coop] config: net=f4mp server=%s name=%s",
+                g_cfg.server, g_cfg.name);
+    else
+        logline("[f4-coop] config: net=legacy role=%s id=%u -> %s:%u",
+                g_cfg.isHost ? "host (listens)" : "client", g_cfg.myId,
+                g_cfg.isHost ? "any" : g_cfg.hostAddr, g_cfg.port);
 }
 
-// ---- UDP transport ------------------------------------------------------
+// ---- ghost state: net thread writes, game thread applies ----------------
+struct GhostEntry
+{
+    float x, y, z;
+    float heading; // radians, as broadcast by the remote player
+};
+static std::mutex g_ghostLock;
+static std::map<unsigned int, GhostEntry> g_ghosts; // playerId -> pos
+static UInt64 g_ghostVersion = 0;                  // bumped on every store
+static std::atomic<bool> g_taskInFlight{false};
+
+// one driven NPC per remote playerId; game-thread only (Run + load events)
+static std::map<unsigned int, void*> g_puppets;
+
+
+// ---- legacy UDP transport (net = legacy fallback) ------------------------
 static SOCKET g_sock = INVALID_SOCKET;
 static sockaddr_in g_dest = {};
 static unsigned int g_seq = 0;
@@ -189,8 +201,6 @@ static bool udpInit()
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) return false;
 
-    // host binds the well-known port; client binds an arbitrary source
-    // port so replies can come back to us
     sockaddr_in self = {};
     self.sin_family = AF_INET;
     self.sin_port = g_cfg.isHost ? htons(g_cfg.port) : 0;
@@ -202,7 +212,6 @@ static bool udpInit()
         return false;
     }
 
-    // non-blocking receive
     u_long nb = 1;
     ioctlsocket(g_sock, FIONBIO, &nb);
 
@@ -227,23 +236,13 @@ static void sendTo(const sockaddr_in& to, unsigned int id, float x, float y, flo
            (const sockaddr*)&to, sizeof(to));
 }
 
-// ---- ghost state: net thread writes, game thread applies ----------------
-struct GhostEntry
-{
-    float x, y, z;
-};
-static std::mutex g_ghostLock;
-static std::map<unsigned int, GhostEntry> g_ghosts; // playerId -> pos
-static UInt64 g_ghostVersion = 0;                   // bumped on every store
-static std::atomic<bool> g_taskInFlight{false};
-
 // record a remote player's position for the game thread to puppet
 static void storeGhost(const PosPacket& p)
 {
     if (p.playerId == g_cfg.myId) return; // never puppet self
     std::lock_guard<std::mutex> lk(g_ghostLock);
     g_ghostVersion++;
-    g_ghosts[p.playerId] = { p.x, p.y, p.z };
+    g_ghosts[p.playerId] = { p.x, p.y, p.z, 0.0f };
 }
 
 static void udpTryRecv()
@@ -272,18 +271,16 @@ static void udpTryRecv()
     }
 }
 
-// ---- host relay: receive clients, rebroadcast everyone to everyone ------
-struct Peer
+struct LegacyPeer
 {
     sockaddr_in addr;
     unsigned int id;
     unsigned long long lastSeen;
 };
-static std::vector<Peer> g_peers; // net thread only
+static std::vector<LegacyPeer> g_peers; // net thread only
 
 static void hostService(bool havePos, float x, float y, float z)
 {
-    // drain incoming
     static float s_lastRxX = 1e30f;
     for (int i = 0; i < 32; i++)
     {
@@ -309,7 +306,7 @@ static void hostService(bool havePos, float x, float y, float z)
         }
         if (!known)
         {
-            Peer np = { from, p.playerId, GetTickCount64() };
+            LegacyPeer np = { from, p.playerId, GetTickCount64() };
             g_peers.push_back(np);
             logline("[f4-coop] peer joined: id=%u", p.playerId);
         }
@@ -324,7 +321,6 @@ static void hostService(bool havePos, float x, float y, float z)
         storeGhost(p);
     }
 
-    // drop peers silent for 5 s
     unsigned long long now = GetTickCount64();
     for (size_t i = 0; i < g_peers.size(); )
     {
@@ -338,9 +334,8 @@ static void hostService(bool havePos, float x, float y, float z)
 
     if (!havePos || g_peers.empty()) return;
 
-    // broadcast the host player + every known remote to every peer
     std::vector<std::pair<unsigned int, GhostEntry>> snap;
-    snap.push_back(std::make_pair(g_cfg.myId, GhostEntry{ x, y, z }));
+    snap.push_back(std::make_pair(g_cfg.myId, GhostEntry{ x, y, z, 0.0f }));
     {
         std::lock_guard<std::mutex> lk(g_ghostLock);
         for (auto& kv : g_ghosts)
@@ -462,8 +457,12 @@ public:
             }
             s_farLogged = false;
 
-            // face the direction of movement (euler Z rotation, radians)
-            float rot[3] = { 0.f, 0.f, atan2f(ddy, ddx) };
+            // face where the remote player faces (euler Z rotation, radians;
+            // fall back to the direction of movement when their heading is 0)
+            float yaw = gh.second.heading;
+            if (yaw == 0.0f && (ddx != 0.0f || ddy != 0.0f))
+                yaw = atan2f(ddy, ddx);
+            float rot[3] = { 0.f, 0.f, yaw };
             float pos[3] = { gh.second.x, gh.second.y, gh.second.z };
 
             UInt32 nullHandle = *(UInt32*)(g_gameBase + kInvalidHandleOffset);
@@ -490,6 +489,212 @@ public:
         }
     }
 };
+
+// ---- F4MP protocol client -----------------------------------------------
+struct F4mpClient
+{
+    std::atomic<bool> welcomed{false};
+    std::atomic<unsigned int> myPlayerId{0};
+};
+static F4mpClient g_f4mp;
+
+static void f4mpHandlePacket(std::span<const std::uint8_t> a_data)
+{
+    using namespace Protocol;
+    switch (PeekType(a_data).value_or(MessageType{}))
+    {
+    case MessageType::kWelcome:
+        if (const auto msg = DecodeWelcome(a_data))
+        {
+            g_f4mp.myPlayerId = msg->playerId;
+            g_f4mp.welcomed = true;
+            logline("[f4-coop] welcomed as player %u in session %016llx",
+                    msg->playerId, (unsigned long long)msg->sessionId);
+        }
+        break;
+    case MessageType::kReject:
+        if (const auto msg = DecodeReject(a_data))
+            logline("[f4-coop] REJECTED: %s", msg->reason.c_str());
+        break;
+    case MessageType::kPlayerJoined:
+        if (const auto msg = DecodePlayerJoined(a_data))
+            logline("[f4-coop] player %u joined: %s",
+                    msg->playerId, msg->name.c_str());
+        break;
+    case MessageType::kPlayerLeft:
+        if (const auto msg = DecodePlayerLeft(a_data))
+            logline("[f4-coop] player %u left", msg->playerId);
+        break;
+    case MessageType::kRemoved:
+        if (const auto msg = DecodeRemoved(a_data))
+            logline("[f4-coop] removed by host: %s",
+                    msg->reason == RemovedReason::kKicked ? "kicked" : "banned");
+        break;
+    case MessageType::kPlayerStates:
+        if (const auto msg = DecodePlayerStates(a_data))
+        {
+            for (const auto& rs : msg->players)
+            {
+                if (rs.playerId == g_f4mp.myPlayerId.load()) continue;
+                std::lock_guard<std::mutex> lk(g_ghostLock);
+                g_ghostVersion++;
+                g_ghosts[rs.playerId] = { rs.state.x, rs.state.y, rs.state.z,
+                                          rs.state.heading };
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void f4mpThreadMain()
+{
+    using Clock = std::chrono::steady_clock;
+    if (!Net::Initialize())
+    {
+        logline("[f4-coop] enet init failed");
+        return;
+    }
+    ENetAddress address{};
+    if (!Net::ResolveAddress(g_cfg.server, Protocol::DEFAULT_PORT, address))
+    {
+        logline("[f4-coop] cannot resolve server %s", g_cfg.server);
+        return;
+    }
+    ENetHost* host = enet_host_create(nullptr, 1, Protocol::CHANNEL_COUNT, 0, 0);
+    if (!host)
+    {
+        logline("[f4-coop] enet host create failed");
+        return;
+    }
+    ENetPeer* peer = enet_host_connect(host, &address, Protocol::CHANNEL_COUNT, 0);
+    if (!peer)
+    {
+        logline("[f4-coop] enet connect failed");
+        return;
+    }
+    logline("[f4-coop] f4mp client connecting to %s ...", g_cfg.server);
+
+    _GetWorldspace getWorldspace =
+        (_GetWorldspace)(g_gameBase + kGetWorldspaceOffset);
+
+    UInt32 sequence = 0;
+    UInt64 lastPosted = 0;
+    float lastX = 0, lastY = 0, lastZ = 0;
+    bool haveLast = false;
+    Clock::time_point lastPosAt{};
+    Clock::time_point nextSend{};
+    Clock::time_point nextConnect{};
+
+    for (;;)
+    {
+        const auto now = Clock::now();
+
+        if (!peer && now >= nextConnect)
+        {
+            peer = enet_host_connect(host, &address, Protocol::CHANNEL_COUNT, 0);
+            nextConnect = now + std::chrono::seconds(3);
+        }
+
+        // service the connection (up to 100 ms) - this is our loop tick
+        ENetEvent event;
+        while (peer && enet_host_service(host, &event, 100) > 0)
+        {
+            switch (event.type)
+            {
+            case ENET_EVENT_TYPE_CONNECT:
+                logline("[f4-coop] connected, sending hello");
+                Net::Send(peer,
+                    Protocol::Encode(Protocol::Hello{
+                        .name = g_cfg.name,
+                    }),
+                    true);
+                break;
+            case ENET_EVENT_TYPE_RECEIVE:
+                f4mpHandlePacket(
+                    std::span<const std::uint8_t>{ event.packet->data,
+                                                   event.packet->dataLength });
+                enet_packet_destroy(event.packet);
+                break;
+            case ENET_EVENT_TYPE_DISCONNECT:
+                logline("[f4-coop] disconnected");
+                g_f4mp.welcomed = false;
+                peer = nullptr;
+                nextConnect = now + std::chrono::seconds(3);
+                break;
+            default:
+                break;
+            }
+        }
+
+        // send our own state at 10 Hz
+        if (g_f4mp.welcomed && g_worldLoaded && now >= nextSend)
+        {
+            nextSend = now + std::chrono::milliseconds(100);
+            void* player = *(void**)(g_gameBase + kPlayerPtrOffset);
+            if (player)
+            {
+                float x = *(float*)((char*)player + kPosOffset);
+                float y = *(float*)((char*)player + kPosOffset + 4);
+                float z = *(float*)((char*)player + kPosOffset + 8);
+
+                float speed = 0.0f;
+                if (haveLast)
+                {
+                    const float dt = std::chrono::duration<float>(now - lastPosAt).count();
+                    const float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
+                    if (dt > 0.001f)
+                        speed = std::sqrt(dx * dx + dy * dy + dz * dz) / dt;
+                }
+                lastX = x; lastY = y; lastZ = z; lastPosAt = now;
+                haveLast = true;
+
+                void* parentCell = *(void**)((char*)player + kParentCellOffset);
+                void* worldspace = getWorldspace(player);
+
+                Protocol::PlayerState s{};
+                s.sequence = ++sequence;
+                s.cell = worldspace ? 0 : formIDOf(parentCell);
+                s.worldspace = formIDOf(worldspace);
+                s.x = x; s.y = y; s.z = z;
+                s.heading = *(float*)((char*)player + kRotOffset + 8); // rot.z
+                s.speed = speed;
+                // 0x01 forward, 0x40 walking, 0x80 running (ActorState::moveMode)
+                s.moveMode = speed > 200.0f ? std::uint16_t{ 0x81 }
+                          : speed > 1.0f   ? std::uint16_t{ 0x41 }
+                                           : std::uint16_t{ 0 };
+                s.flags = speed > 200.0f ? Protocol::kRunning : Protocol::kNone;
+                s.sentMs = Protocol::SentMs(now);
+                Net::Send(peer, Protocol::Encode(s), false);
+            }
+        }
+
+        // post at most one apply task at a time, and only on fresh data
+        UInt64 version;
+        {
+            std::lock_guard<std::mutex> lk(g_ghostLock);
+            version = g_ghostVersion;
+        }
+        bool armedNow =
+            g_applyArmed && g_f4mp.welcomed &&
+            (GetTickCount64() - g_armedAtTick.load() >= kArmGraceMs);
+        static bool s_graceLogged = false;
+        if (armedNow && !s_graceLogged)
+        {
+            s_graceLogged = true;
+            logline("[f4-coop] grace elapsed, applying moves");
+        }
+        if (!g_applyArmed)
+            s_graceLogged = false; // re-log after the next load
+        if (armedNow && version != lastPosted && g_tasks &&
+            !g_taskInFlight.exchange(true))
+        {
+            lastPosted = version;
+            g_tasks->AddTask(new ApplyGhostMoveTask());
+        }
+    }
+}
 // -------------------------------------------------------------------------
 
 static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
@@ -530,7 +735,7 @@ static void onF4SEMessage(F4SEMessagingInterface::Message* msg)
     }
 }
 
-static void positionThreadMain()
+static void legacyThreadMain()
 {
     float lastX = 0.0f, lastY = 0.0f, lastZ = 0.0f;
     bool haveLast = false;
@@ -553,8 +758,6 @@ static void positionThreadMain()
             }
         }
 
-        // host services the socket even in menus so peers can join;
-        // clients only talk once they have a position to send
         if (g_cfg.isHost)
             hostService(havePos, x, y, z);
         else if (havePos)
@@ -563,7 +766,6 @@ static void positionThreadMain()
             udpTryRecv();
         }
 
-        // post at most one apply task at a time, and only on fresh data
         UInt64 version;
         {
             std::lock_guard<std::mutex> lk(g_ghostLock);
@@ -608,7 +810,7 @@ extern "C"
     {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name        = "f4-coop";
-        info->version     = 14;
+        info->version     = 15;
 
         if (f4se->runtimeVersion != RUNTIME_VERSION_1_10_163)
         {
@@ -638,18 +840,11 @@ extern "C"
 
         loadConfig();
 
-        if (!udpInit())
-            logline("[f4-coop] udp init FAILED (wsa=%d)", WSAGetLastError());
-        else if (g_cfg.isHost)
-            logline("[f4-coop] host relay listening on %u", g_cfg.port);
-        else
-            logline("[f4-coop] client sending to %s:%u",
-                    g_cfg.hostAddr, g_cfg.port);
-
-        std::thread t(positionThreadMain);
+        std::thread t(g_cfg.isF4mp ? f4mpThreadMain : legacyThreadMain);
         t.detach();
-        logline("[f4-coop] loaded v14, handle=%u runtime=0x%08X",
-                g_pluginHandle, f4se->runtimeVersion);
+        logline("[f4-coop] loaded v15 (net=%s), handle=%u runtime=0x%08X",
+                g_cfg.isF4mp ? "f4mp" : "legacy", g_pluginHandle,
+                f4se->runtimeVersion);
         return true;
     }
 }
